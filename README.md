@@ -31,6 +31,7 @@ Or recompile from source: `javac Super3DX.java && jar cf Super3DX.jar Super3DX.c
 | `-` | Physics simulation |
 | `=` | Custom shader |
 | `/` | Tile-based multithreaded rendering |
+| `L` | Multi-light demo (directional + ambient + point + spot) |
 | `A` | Audio click |
 | `S` | Audio hit |
 
@@ -57,10 +58,14 @@ Or recompile from source: `javac Super3DX.java && jar cf Super3DX.jar Super3DX.c
 | `setBlendMode(BlendMode mode)` | Set blend mode: NONE, ALPHA, ADDITIVE |
 | `setRenderMode(RenderMode mode)` | Set render mode: SOLID, WIREFRAME, SOLID_WIREFRAME |
 | `setGammaCorrection(boolean enable)` | Enable/disable gamma correction (pow 1/2.2) |
-| `setLightDirection(Vec3 dir)` | Set directional light direction |
-| `setLighting(float ambient, float diffuse)` | Set ambient and diffuse intensities |
+| `setLightDirection(Vec3 dir)` | Set/set/get/clear lights (backward compat: finds first directional) |
+| `setLighting(float ambient, float diffuse)` | Backward compat: set ambient+directional intensity |
+| `addLight(Light light)` | Add a light to the scene |
+| `clearLights()` | Remove all lights |
+| `getLights()` | Return `Light[]` array of all lights |
 | `setSpecular(float intensity, float shininess)` | Set specular intensity and shininess |
 | `setDayNightCycle(float timeOfDay)` | Animate sun position (0-1) with automatic lighting |
+| `resetDefaultLights()` | Restore default ambient + directional lights |
 | `setFog(Color color, float near, float far)` | Enable linear fog with color and distance range |
 | `disableFog()` | Disable fog rendering |
 | `toggleWireframe()` | Toggle between SOLID and WIREFRAME modes |
@@ -504,6 +509,42 @@ Splits the screen into a grid of tiles (default 32×32). Each tile is processed 
 
 ---
 
+### Light
+
+A light source with four types: `DIRECTIONAL`, `POINT`, `AMBIENT`, `SPOT`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | `Light.Type` | `DIRECTIONAL` | Light type enum |
+| `r, g, b` | `float` | `1,1,1` | Light color components |
+| `intensity` | `float` | `1.0` | Light brightness multiplier |
+| `position` | `Vec3` | `(0,0,0)` | Position for POINT and SPOT |
+| `direction` | `Vec3` | `(0,-1,0)` | Direction for DIRECTIONAL and SPOT |
+| `range` | `float` | `10.0` | Cutoff distance for POINT and SPOT |
+| `spotInnerAngle` | `float` | `15.0` | Inner cone angle (degrees) — full brightness within |
+| `spotOuterAngle` | `float` | `30.0` | Outer cone angle (degrees) — zero brightness beyond |
+| `constantAtten` | `float` | `1.0` | Constant attenuation coefficient |
+| `linearAtten` | `float` | `0.09` | Linear attenuation coefficient |
+| `quadraticAtten` | `float` | `0.032` | Quadratic attenuation coefficient |
+| `castShadows` | `boolean` | `false` | Whether this light casts shadows |
+
+| Factory Method | Returns |
+|----------------|---------|
+| `Light.directional(Vec3 dir, Vec3 color, float intensity)` | Directional light (infinite, parallel rays) |
+| `Light.point(Vec3 pos, Vec3 color, float intensity, float range)` | Point light with distance attenuation |
+| `Light.ambient(Vec3 color, float intensity)` | Ambient light (uniform fill) |
+| `Light.spot(Vec3 pos, Vec3 dir, Vec3 color, float intensity, float range, float innerDeg, float outerDeg)` | Spot light with cone falloff |
+
+Common usage:
+```java
+engine.addLight(Light.ambient(0.3f, 0.3f, 0.3f, 0.3f));
+engine.addLight(Light.directional(new Vec3(0.5f, -0.7f, 0.3f).normalize(), 1f, 1f, 1f, 0.7f));
+engine.addLight(Light.point(new Vec3(0, 1, 0), 1f, 0.2f, 0.2f, 1.5f, 4f));
+engine.addLight(Light.spot(new Vec3(0, 3, 0), new Vec3(0, -1, 0), 1f, 1f, 0.8f, 0.8f, 5f, 15f, 30f));
+```
+
+---
+
 ### Audio (Super3DX.Audio)
 
 | Method | Description |
@@ -635,4 +676,14 @@ input.update(); // call once per frame
 Super3DX.Audio audio = new Super3DX.Audio();
 audio.playTone(440, 0.5f, 0.3f); // 440Hz for 0.5s
 audio.close(); // cleanup
+```
+
+### Multi-Light
+```java
+r.clearLights();
+r.addLight(Light.ambient(0.3f, 0.3f, 0.3f, 0.3f));
+r.addLight(Light.directional(new Super3DX.Vec3(0.5f, -0.7f, 0.3f).normalize(), 1f, 1f, 1f, 0.7f));
+r.addLight(Light.point(new Super3DX.Vec3(1, 0.5f, 1), 1f, 0.2f, 0.2f, 1.5f, 4f));
+r.addLight(Light.spot(new Super3DX.Vec3(0, 3, 0), new Super3DX.Vec3(0, -1, 0.3f), 1f, 1f, 0.8f, 0.8f, 5f, 15f, 30f));
+// All subsequent renderMesh calls use accumulated lighting from all lights
 ```

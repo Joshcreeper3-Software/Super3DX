@@ -22,9 +22,7 @@ public class Super3DX {
     private float fov = 60.0f;
     private boolean backfaceCulling = true;
     
-    private Vec3 lightDir = new Vec3(0.5f, -1.0f, 0.3f).normalize();
-    private float ambientIntensity = 0.3f;
-    private float diffuseIntensity = 0.7f;
+    private final java.util.List<Light> lights = new ArrayList<>();
     private float specularIntensity = 0.6f;
     private float shininess = 32.0f;
     private Vec3 cameraPos = new Vec3();
@@ -80,6 +78,13 @@ public class Super3DX {
         initTiles(32);
         
         setPerspective(fov, (float)width / height, nearClip, farClip);
+        resetDefaultLights();
+    }
+
+    public void resetDefaultLights() {
+        lights.clear();
+        lights.add(Light.ambient(0.3f, 0.3f, 0.3f, 0.3f));
+        lights.add(Light.directional(new Vec3(0.5f, -1.0f, 0.3f).normalize(), 1f, 1f, 1f, 0.7f));
     }
     
     public void enableTileBased(boolean enable, int tileSize) {
@@ -361,16 +366,19 @@ public class Super3DX {
             
             if (numVerts < 3) continue;
             
-            // Per-vertex Blinn-Phong lighting (before perspective divide)
+            // Per-vertex multi-light accumulation (before perspective divide)
+            float[] lrgb = new float[3];
             for (int j = 0; j < numVerts; j++) {
                 Vertex v = clipped[j];
                 Vec3 normal = v.normal.clone();
-                float diff = Math.max(0, normal.dot(lightDir));
                 Vec3 viewDir = new Vec3(cameraPos.x - v.wx, cameraPos.y - v.wy, cameraPos.z - v.wz).normalize();
-                Vec3 halfDir = lightDir.add(viewDir).normalize();
-                float spec = (float)Math.pow(Math.max(0, normal.dot(halfDir)), shininess);
-                float light = ambientIntensity + diffuseIntensity * diff + specularIntensity * spec;
-                v.color = scaleColor(v.color, light);
+                accumulateLight(new Vec3(v.wx, v.wy, v.wz), normal, viewDir, lrgb);
+                float r = Math.min(1, lrgb[0]);
+                float g = Math.min(1, lrgb[1]);
+                float b = Math.min(1, lrgb[2]);
+                v.color = new Color(Math.min(255, (int)(v.color.getRed() * r)),
+                                    Math.min(255, (int)(v.color.getGreen() * g)),
+                                    Math.min(255, (int)(v.color.getBlue() * b)));
             }
             
             // Perspective division and screen mapping
@@ -446,6 +454,95 @@ public class Super3DX {
         }
     }
     
+    private void accumulateLight(Vec3 pos, Vec3 normal, Vec3 viewDir, float[] outRgb) {
+        outRgb[0] = outRgb[1] = outRgb[2] = 0;
+        for (Light l : lights) {
+            switch (l.type) {
+                case AMBIENT:
+                    outRgb[0] += l.r * l.intensity;
+                    outRgb[1] += l.g * l.intensity;
+                    outRgb[2] += l.b * l.intensity;
+                    break;
+                case DIRECTIONAL: {
+                    float NdotL = Math.max(0, normal.dot(l.direction));
+                    if (NdotL <= 0) break;
+                    Vec3 halfDir = l.direction.add(viewDir).normalize();
+                    float NdotH = Math.max(0, normal.dot(halfDir));
+                    float spec = (float)Math.pow(NdotH, shininess);
+                    float factor = l.intensity * NdotL;
+                    outRgb[0] += l.r * factor;
+                    outRgb[1] += l.g * factor;
+                    outRgb[2] += l.b * factor;
+                    if (spec > 0) {
+                        float sf = specularIntensity * spec;
+                        outRgb[0] += sf;
+                        outRgb[1] += sf;
+                        outRgb[2] += sf;
+                    }
+                    break;
+                }
+                case POINT: {
+                    Vec3 toLight = l.position.sub(pos);
+                    float dist = toLight.length();
+                    if (dist > l.range) break;
+                    Vec3 ldir = toLight.scale(1f / Math.max(dist, 1e-10f));
+                    float NdotL = Math.max(0, normal.dot(ldir));
+                    if (NdotL <= 0) break;
+                    float atten = 1f / (l.constantAtten + l.linearAtten * dist + l.quadraticAtten * dist * dist);
+                    Vec3 halfDir = ldir.add(viewDir).normalize();
+                    float NdotH = Math.max(0, normal.dot(halfDir));
+                    float spec = (float)Math.pow(NdotH, shininess);
+                    float factor = l.intensity * NdotL * atten;
+                    outRgb[0] += l.r * factor;
+                    outRgb[1] += l.g * factor;
+                    outRgb[2] += l.b * factor;
+                    if (spec > 0) {
+                        float sf = specularIntensity * spec * atten;
+                        outRgb[0] += sf;
+                        outRgb[1] += sf;
+                        outRgb[2] += sf;
+                    }
+                    break;
+                }
+                case SPOT: {
+                    Vec3 toLight = l.position.sub(pos);
+                    float dist = toLight.length();
+                    if (dist > l.range) break;
+                    Vec3 ldir = toLight.scale(1f / Math.max(dist, 1e-10f));
+                    float NdotL = Math.max(0, normal.dot(ldir));
+                    if (NdotL <= 0) break;
+                    float cosOuter = (float)Math.cos(l.spotOuterAngle * Math.PI / 180);
+                    float cosInner = (float)Math.cos(l.spotInnerAngle * Math.PI / 180);
+                    float cosAngle = -ldir.dot(l.direction);
+                    float spotFactor;
+                    if (cosAngle <= cosOuter) {
+                        spotFactor = 0;
+                    } else if (cosAngle >= cosInner) {
+                        spotFactor = 1;
+                    } else {
+                        spotFactor = (cosAngle - cosOuter) / (cosInner - cosOuter);
+                    }
+                    if (spotFactor <= 0) break;
+                    float atten = 1f / (l.constantAtten + l.linearAtten * dist + l.quadraticAtten * dist * dist);
+                    Vec3 halfDir = ldir.add(viewDir).normalize();
+                    float NdotH = Math.max(0, normal.dot(halfDir));
+                    float spec = (float)Math.pow(NdotH, shininess);
+                    float factor = l.intensity * NdotL * atten * spotFactor;
+                    outRgb[0] += l.r * factor;
+                    outRgb[1] += l.g * factor;
+                    outRgb[2] += l.b * factor;
+                    if (spec > 0) {
+                        float sf = specularIntensity * spec * atten * spotFactor;
+                        outRgb[0] += sf;
+                        outRgb[1] += sf;
+                        outRgb[2] += sf;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     private Color scaleColor(Color color, float factor) {
         int r = Math.min(255, Math.max(0, (int)(color.getRed() * factor)));
         int g = Math.min(255, Math.max(0, (int)(color.getGreen() * factor)));
@@ -885,14 +982,21 @@ public class Super3DX {
                         float invD = 1f / (float)Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
                         ddx *= invD; ddy *= invD; ddz *= invD;
 
-                        float diff = ddx * lightDir.x + ddy * lightDir.y + ddz * lightDir.z;
-                        diff = Math.max(0, diff);
-                        float light = ambientIntensity + diffuseIntensity * diff;
-                        light = Math.min(1, light);
-                        int r = (int)(color.getRed() * light);
-                        int g = (int)(color.getGreen() * light);
-                        int b = (int)(color.getBlue() * light);
-                        color = new Color(Math.min(255, r), Math.min(255, g), Math.min(255, b));
+                        // Per-pixel multi-light accumulation
+                        float wpx = lerp(wx1, wx2, t) / iw;
+                        float wpy = lerp(wy1, wy2, t) / iw;
+                        float wpz = lerp(wz1, wz2, t) / iw;
+                        Vec3 pn = new Vec3(ddx, ddy, ddz);
+                        Vec3 pv = new Vec3(cameraPos.x - wpx, cameraPos.y - wpy, cameraPos.z - wpz).normalize();
+                        float[] lr = new float[3];
+                        accumulateLight(new Vec3(wpx, wpy, wpz), pn, pv, lr);
+                        float lr2 = Math.min(1, lr[0]);
+                        float lg = Math.min(1, lr[1]);
+                        float lb = Math.min(1, lr[2]);
+                        int pr = (int)(color.getRed() * lr2);
+                        int pg = (int)(color.getGreen() * lg);
+                        int pb = (int)(color.getBlue() * lb);
+                        color = new Color(Math.min(255, pr), Math.min(255, pg), Math.min(255, pb));
                     }
 
                     // Shadow map lookup
@@ -1094,13 +1198,37 @@ public class Super3DX {
         this.backfaceCulling = cull;
     }
     
-    public void setLightDirection(Vec3 dir) {
-        this.lightDir = dir.normalize();
+    public void addLight(Light light) {
+        lights.add(light);
     }
-    
+
+    public void clearLights() {
+        lights.clear();
+    }
+
+    public Light[] getLights() {
+        return lights.toArray(new Light[0]);
+    }
+
+    public void setLightDirection(Vec3 dir) {
+        Vec3 d = dir.normalize();
+        for (Light l : lights) {
+            if (l.type == Light.Type.DIRECTIONAL) {
+                l.direction = d;
+                return;
+            }
+        }
+        lights.add(Light.directional(d, 1f, 1f, 1f, 0.7f));
+    }
+
     public void setLighting(float ambient, float diffuse) {
-        this.ambientIntensity = ambient;
-        this.diffuseIntensity = diffuse;
+        boolean foundAmbient = false, foundDir = false;
+        for (Light l : lights) {
+            if (l.type == Light.Type.AMBIENT) { l.intensity = ambient; foundAmbient = true; }
+            if (l.type == Light.Type.DIRECTIONAL) { l.intensity = diffuse; foundDir = true; }
+        }
+        if (!foundAmbient) lights.add(Light.ambient(ambient, ambient, ambient, ambient));
+        if (!foundDir) lights.add(Light.directional(new Vec3(0.5f, -1, 0.3f).normalize(), 1f, 1f, 1f, diffuse));
     }
     
     // ======================== INNER CLASSES ========================
@@ -2079,10 +2207,19 @@ public class Super3DX {
         float sunAngle = timeOfDay * 2 * (float)Math.PI;
         float sunHeight = (float)Math.sin(sunAngle);
         float sunHorizontal = (float)Math.cos(sunAngle);
-        lightDir = new Vec3(sunHorizontal * 0.5f, sunHeight, 0.3f).normalize();
-        ambientIntensity = 0.1f + 0.4f * Math.max(0, sunHeight);
-        diffuseIntensity = 0.3f + 0.7f * Math.max(0, sunHeight);
-    }    
+        Vec3 sunDir = new Vec3(sunHorizontal * 0.5f, sunHeight, 0.3f).normalize();
+        float amb = 0.1f + 0.4f * Math.max(0, sunHeight);
+        float dif = 0.3f + 0.7f * Math.max(0, sunHeight);
+        for (Light l : lights) {
+            if (l.type == Light.Type.DIRECTIONAL) {
+                l.direction = sunDir;
+                l.intensity = dif;
+            }
+            if (l.type == Light.Type.AMBIENT) {
+                l.intensity = amb;
+            }
+        }
+    }
     // ==================== OPENGL SHADER SUPPORT ====================
     
     public static class Shader {
@@ -2194,6 +2331,80 @@ public class Super3DX {
             return new Color(Math.min(255, (int)(r * 255)), 
                            Math.min(255, (int)(g * 255)), 
                            Math.min(255, (int)(b * 255)));
+        }
+
+        public static Color calculatePBRMulti(Color albedo, float metallic, float roughness,
+                                               Vec3 normal, Vec3 viewDir, Vec3 worldPos,
+                                               java.util.List<Light> lights) {
+            float rr = 0, gg = 0, bb = 0;
+            Vec3 halfDir, lightDir;
+            float NdotL, NdotV, NdotH, diffuse, alpha, alpha2, denom, D, k, G1, G2, G, F0, F, specular;
+            float atten, spotFactor, cosOuter, cosInner, cosAngle, intensity;
+            NdotV = Math.max(0, normal.dot(viewDir));
+            alpha = roughness * roughness;
+            alpha2 = alpha * alpha;
+            k = alpha / 2;
+            F0 = 0.04f + (1 - 0.04f) * metallic;
+            for (Light l : lights) {
+                switch (l.type) {
+                    case AMBIENT:
+                        rr += l.r * l.intensity;
+                        gg += l.g * l.intensity;
+                        bb += l.b * l.intensity;
+                        continue;
+                    case DIRECTIONAL:
+                        lightDir = l.direction;
+                        atten = 1f;
+                        spotFactor = 1f;
+                        intensity = l.intensity;
+                        break;
+                    case POINT: {
+                        Vec3 toLight = l.position.sub(worldPos);
+                        float d = toLight.length();
+                        if (d > l.range) continue;
+                        lightDir = toLight.scale(1f / Math.max(d, 1e-10f));
+                        atten = 1f / (l.constantAtten + l.linearAtten * d + l.quadraticAtten * d * d);
+                        spotFactor = 1f;
+                        intensity = l.intensity;
+                        break;
+                    }
+                    case SPOT: {
+                        Vec3 toLight = l.position.sub(worldPos);
+                        float d = toLight.length();
+                        if (d > l.range) continue;
+                        lightDir = toLight.scale(1f / Math.max(d, 1e-10f));
+                        cosOuter = (float)Math.cos(l.spotOuterAngle * Math.PI / 180);
+                        cosInner = (float)Math.cos(l.spotInnerAngle * Math.PI / 180);
+                        cosAngle = -lightDir.dot(l.direction);
+                        if (cosAngle <= cosOuter) continue;
+                        spotFactor = cosAngle >= cosInner ? 1f : (cosAngle - cosOuter) / (cosInner - cosOuter);
+                        atten = 1f / (l.constantAtten + l.linearAtten * d + l.quadraticAtten * d * d);
+                        intensity = l.intensity;
+                        break;
+                    }
+                    default: continue;
+                }
+                NdotL = Math.max(0, normal.dot(lightDir));
+                if (NdotL <= 0) continue;
+                halfDir = lightDir.add(viewDir).normalize();
+                NdotH = Math.max(0, normal.dot(halfDir));
+                diffuse = NdotL;
+                denom = NdotH * NdotH * (alpha2 - 1) + 1;
+                D = alpha2 / (Math.max(0.0001f, (float)Math.PI) * denom * denom);
+                G1 = NdotL / (NdotL * (1 - k) + k);
+                G2 = NdotV / (NdotV * (1 - k) + k);
+                G = G1 * G2;
+                F = F0 + (1 - F0) * (float)Math.pow(1 - NdotV, 5);
+                specular = D * F * G / (4 * NdotV * NdotL + 0.0001f);
+                float contrib = intensity * NdotL * atten * spotFactor;
+                rr += l.r * (diffuse + specular * metallic) * contrib;
+                gg += l.g * (diffuse + specular * metallic) * contrib;
+                bb += l.b * (diffuse + specular * metallic) * contrib;
+            }
+            float ar = albedo.getRed() / 255f, ag = albedo.getGreen() / 255f, ab = albedo.getBlue() / 255f;
+            return new Color(Math.min(255, (int)(ar * rr * 255)),
+                             Math.min(255, (int)(ag * gg * 255)),
+                             Math.min(255, (int)(ab * bb * 255)));
         }
     }    
     // ==================== DEFERRED RENDERING ====================

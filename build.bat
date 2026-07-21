@@ -4,7 +4,7 @@ echo.
 
 REM Step 1: Compile engine
 echo Compiling engine...
-javac -encoding UTF-8 Super3DX.java
+javac -encoding UTF-8 Light.java Super3DX.java
 if %errorlevel% neq 0 (
     echo Compilation failed!
     exit /b 1
@@ -13,7 +13,7 @@ echo Engine compiled.
 
 REM Step 2: Package library JAR
 echo Creating Super3DX.jar...
-jar cf Super3DX.jar Super3DX.class Super3DX$*.class
+jar cf Super3DX.jar Super3DX.class Super3DX$*.class Light.class Light$*.class
 if %errorlevel% neq 0 (
     echo Failed to create Super3DX.jar
     exit /b 1
@@ -33,6 +33,8 @@ echo Test compiled.
 REM Step 4: Clean up engine class files (not the test class)
 del Super3DX.class
 del Super3DX$*.class
+del Light.class
+del Light$*.class
 
 REM Step 5: Create manifest for test JAR
 echo Main-Class: Super3DXTest> manifest.txt

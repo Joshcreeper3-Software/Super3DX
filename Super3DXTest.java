@@ -15,7 +15,7 @@ public class Super3DXTest extends JPanel implements Runnable {
     private boolean running = true, wireframe = false, gamma = false, bloom = false;
     private boolean fog = false, fxaa = false, particles = true, normalMap = false, skybox = true;
     private boolean animating = false, useSceneGraph = false, usePhysics = false, useTiles = false;
-    private boolean useShader = false;
+    private boolean useShader = false, useMultiLight = false;
     private int fps = 0, frameCount = 0;
     private long lastFpsTime = System.nanoTime();
     private Thread renderThread;
@@ -53,9 +53,8 @@ public class Super3DXTest extends JPanel implements Runnable {
 
         engine = new Super3DX(800, 600);
         engine.setBackfaceCulling(true);
-        engine.setLighting(0.3f, 0.7f);
         engine.setSpecular(0.6f, 32f);
-        engine.setLightDirection(new Super3DX.Vec3(0.5f, -0.7f, 0.3f));
+        setupLights();
 
         skyTex = Super3DX.Texture.createCheckerboard(256, 256, 32, new Color(30, 40, 70), new Color(60, 80, 120));
         checkerTex = Super3DX.Texture.createCheckerboard(64, 64, 8, new Color(255, 50, 50), new Color(50, 150, 255));
@@ -164,6 +163,12 @@ public class Super3DXTest extends JPanel implements Runnable {
         for (Super3DX.Vertex v : animMesh.vertices) { v.boneWeights[0] = 1f; v.boneIndices[0] = 0; }
     }
 
+    private void setupLights() {
+        engine.clearLights();
+        engine.addLight(Light.ambient(0.3f, 0.3f, 0.3f, 0.3f));
+        engine.addLight(Light.directional(new Super3DX.Vec3(0.5f, -0.7f, 0.3f).normalize(), 1f, 1f, 1f, 0.7f));
+    }
+
     private void setupSceneGraph() {
         rootNode = new Super3DX.Node("root");
         Super3DX.Node child1 = new Super3DX.Node("cube1").setMesh(cube).setTexture(checkerTex);
@@ -269,6 +274,18 @@ public class Super3DXTest extends JPanel implements Runnable {
 
         if (useTiles) engine.enableTileBased(true, 32);
 
+        // Move the first point light in multi-light mode
+        if (useMultiLight) {
+            for (Light l : engine.getLights()) {
+                if (l.type == Light.Type.POINT && l.r > 0.8f) {
+                    l.position.x = (float)(Math.sin(angleY * 1.5f) * 2.5f);
+                    l.position.z = (float)(Math.cos(angleY * 1.5f) * 2.5f);
+                    l.position.y = 0.5f + (float)Math.sin(angleY * 2) * 0.3f;
+                    break;
+                }
+            }
+        }
+
         // Shadow pass for main cube
         Super3DX.Matrix4x4 transform = new Super3DX.Matrix4x4();
         transform.rotateX(angleX); transform.rotateY(angleY);
@@ -353,7 +370,8 @@ public class Super3DXTest extends JPanel implements Runnable {
         engine.drawText("[-] Physics  [" + yn(usePhysics) + "]", 10, y, Color.CYAN); y += 18;
         engine.drawText("[=] Shader   [" + yn(useShader) + "]", 10, y, Color.CYAN); y += 18;
         engine.drawText("[/] Tiles    [" + yn(useTiles) + "]", 10, y, Color.CYAN); y += 18;
-        engine.drawText("P VertPool: " + vertPool.active() + "/" + vertPool.total(), 10, y, Color.LIGHT_GRAY); y += 18;
+        engine.drawText("[L] Lights   [" + yn(useMultiLight) + "]", 10, y, Color.CYAN); y += 18;
+        engine.drawText("Lights: " + engine.getLights().length + "  VertPool: " + vertPool.active() + "/" + vertPool.total(), 10, y, Color.LIGHT_GRAY); y += 18;
         engine.drawText("SPACE: Pause  ESC: Exit", 10, y, Color.WHITE);
     }
 
@@ -376,6 +394,13 @@ public class Super3DXTest extends JPanel implements Runnable {
             case KeyEvent.VK_MINUS: usePhysics = !usePhysics; if (usePhysics) setupPhysics(); audio.playClick(); return;
             case KeyEvent.VK_EQUALS: useShader = !useShader; audio.playClick(); return;
             case KeyEvent.VK_SLASH: useTiles = !useTiles; engine.enableTileBased(useTiles, 32); audio.playClick(); return;
+            case KeyEvent.VK_L: useMultiLight = !useMultiLight; setupLights(); if (useMultiLight) {
+                float cx = (float)(Math.sin(camAngle) * camDist * 0.5f);
+                float cz = (float)(Math.cos(camAngle) * camDist * 0.5f);
+                engine.addLight(Light.point(new Super3DX.Vec3(cx, 0.5f, cz), 1f, 0.2f, 0.2f, 1.5f, 4f));
+                engine.addLight(Light.point(new Super3DX.Vec3(-cx, -0.2f, -cz), 0.2f, 0.4f, 1f, 1.2f, 3f));
+                engine.addLight(Light.spot(new Super3DX.Vec3(0, 3f, 0), new Super3DX.Vec3(0, -1, 0.3f), 1f, 1f, 0.8f, 0.8f, 5f, 15f, 30f));
+            } audio.playClick(); return;
         }
     }
 
