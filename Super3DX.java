@@ -1,6 +1,7 @@
 import java.awt.*;
 import java.awt.image.*;
 import java.util.*;
+import java.util.concurrent.*;
 import java.io.*;
 import java.nio.file.*;
 
@@ -27,6 +28,18 @@ public class Super3DX {
     private float specularIntensity = 0.6f;
     private float shininess = 32.0f;
     private Vec3 cameraPos = new Vec3();
+    
+    // === THREADING & TILE-BASED ===
+    private final ForkJoinPool threadPool;
+    private TileRegion[] tileRegions;
+    private java.util.List<TriangleBatch>[] tileBatches;
+    private boolean useTileBased = false;
+    private int tileSize = 32;
+    private int numThreads;
+    
+    // === PROFILING ===
+    public int statsDrawCalls, statsTriangles, statsPixels;
+    public long statsRasterTime, statsFrameTime;
     
     private ShadowMap shadowMap;
     private final Matrix4x4 lightViewMatrix = new Matrix4x4();
@@ -62,7 +75,29 @@ public class Super3DX {
         this.zBuffer = new float[width * height];
         this.image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
         
+        this.numThreads = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
+        this.threadPool = new ForkJoinPool(numThreads);
+        initTiles(32);
+        
         setPerspective(fov, (float)width / height, nearClip, farClip);
+    }
+    
+    public void enableTileBased(boolean enable, int tileSize) {
+        this.useTileBased = enable && numThreads > 1;
+        if (this.tileSize != tileSize) { this.tileSize = tileSize; initTiles(tileSize); }
+    }
+    
+    @SuppressWarnings("unchecked")
+    private void initTiles(int ts) {
+        this.tileSize = ts;
+        int tx = (width + ts - 1) / ts, ty = (height + ts - 1) / ts;
+        tileRegions = new TileRegion[tx * ty];
+        tileBatches = new java.util.List[tx * ty];
+        for (int y = 0; y < ty; y++) for (int x = 0; x < tx; x++) {
+            int idx = y * tx + x;
+            tileRegions[idx] = new TileRegion(x * ts, y * ts, Math.min(ts, width - x * ts), Math.min(ts, height - y * ts));
+            tileBatches[idx] = new ArrayList<>();
+        }
     }
     
     public void setCamera(Vec3 position, Vec3 target, Vec3 up) {
@@ -373,15 +408,28 @@ public class Super3DX {
             
             // Rasterize triangles
             if (renderMode != RenderMode.WIREFRAME) {
-                for (int j = 1; j < numVerts - 1; j++) {
-                    Vertex a = clipped[0];
-                    Vertex b = clipped[j];
-                    Vertex c = clipped[j + 1];
-                    
-                    if (texture != null) {
-                        rasterizeTexturedTriangle(a, b, c, texture, normalMap);
-                    } else {
-                        rasterizeTriangle(a, b, c);
+                if (useTileBased && threadPool != null) {
+                    // Collect into tile batches for parallel processing
+                    for (int j = 1; j < numVerts - 1; j++) {
+                        int triIdx = statsTriangles++;
+                        for (int ti = 0; ti < tileRegions.length; ti++) {
+                            Vertex a = clipped[0], b = clipped[j], c = clipped[j + 1];
+                            int minX = Math.max(tileRegions[ti].x, Math.max(0, Math.min(a.screenX, Math.min(b.screenX, c.screenX))));
+                            int maxX = Math.min(tileRegions[ti].x + tileRegions[ti].w - 1, Math.min(width - 1, Math.max(a.screenX, Math.max(b.screenX, c.screenX))));
+                            int minY = Math.max(tileRegions[ti].y, Math.max(0, Math.min(a.screenY, Math.min(b.screenY, c.screenY))));
+                            int maxY = Math.min(tileRegions[ti].y + tileRegions[ti].h - 1, Math.min(height - 1, Math.max(a.screenY, Math.max(b.screenY, c.screenY))));
+                            if (minX <= maxX && minY <= maxY) {
+                                // Rasterize directly to this tile region
+                                if (texture != null) rasterizeTexturedTriangleClipped(a, b, c, texture, normalMap, minX, maxX, minY, maxY);
+                                else rasterizeTriangleClipped(a, b, c, minX, maxX, minY, maxY);
+                            }
+                        }
+                    }
+                } else {
+                    for (int j = 1; j < numVerts - 1; j++) {
+                        Vertex a = clipped[0], b = clipped[j], c = clipped[j + 1];
+                        if (texture != null) rasterizeTexturedTriangle(a, b, c, texture, normalMap);
+                        else rasterizeTriangle(a, b, c);
                     }
                 }
             }
@@ -2421,7 +2469,343 @@ public class Super3DX {
         public static ComputeKernel particleUpdateKernel = (id) -> {
             // Update particle positions
         };
-    }}
+    }
+    
+    // ============================================================
+    // TILE-BASED RENDERING
+    // ============================================================
+    public static class TileRegion {
+        public int x, y, w, h;
+        public TileRegion(int x, int y, int w, int h) { this.x = x; this.y = y; this.w = w; this.h = h; }
+    }
+    
+    static class TriangleBatch {
+        Mesh mesh; Matrix4x4 world; Texture tex, nm; int[] indices; int offset, count; boolean shadow;
+        TriangleBatch(Mesh m, Matrix4x4 w, Texture t, Texture n, int[] idx, int off, int cnt, boolean s) {
+            mesh = m; world = w; tex = t; nm = n; indices = idx; offset = off; count = cnt; shadow = s;
+        }
+    }
+    
+    public void renderTileBased() {
+        if (!useTileBased || threadPool == null) return;
+        long t0 = System.nanoTime();
+        int numTiles = tileRegions.length;
+        for (int i = 0; i < numTiles; i++) {
+            if (!tileBatches[i].isEmpty()) {
+                final int ti = i;
+                threadPool.execute(() -> processTile(ti));
+            }
+        }
+        // Wait via ForkJoinPool common quiescence
+        while (!threadPool.isQuiescent()) Thread.yield();
+        // Clear batches
+        for (int i = 0; i < numTiles; i++) tileBatches[i].clear();
+        statsRasterTime = System.nanoTime() - t0;
+    }
+    
+    private void processTile(int tileIdx) {
+        TileRegion tr = tileRegions[tileIdx];
+        java.util.List<TriangleBatch> batches = tileBatches[tileIdx];
+        int tx1 = tr.x, ty1 = tr.y, tx2 = tr.x + tr.w, ty2 = tr.y + tr.h;
+        for (TriangleBatch batch : batches) {
+            for (int t = batch.offset; t < batch.offset + batch.count; t++) {
+                int i0 = batch.indices[t * 3], i1 = batch.indices[t * 3 + 1], i2 = batch.indices[t * 3 + 2];
+                Vertex v0 = batch.mesh.vertices[i0], v1 = batch.mesh.vertices[i1], v2 = batch.mesh.vertices[i2];
+                // Quick AABB test against tile
+                int minX = Math.max(tx1, Math.max(0, Math.min(v0.screenX, Math.min(v1.screenX, v2.screenX))));
+                int maxX = Math.min(tx2 - 1, Math.min(width - 1, Math.max(v0.screenX, Math.max(v1.screenX, v2.screenX))));
+                int minY = Math.max(ty1, Math.max(0, Math.min(v0.screenY, Math.min(v1.screenY, v2.screenY))));
+                int maxY = Math.min(ty2 - 1, Math.min(height - 1, Math.max(v0.screenY, Math.max(v1.screenY, v2.screenY))));
+                if (minX > maxX || minY > maxY) continue;
+                if (batch.tex != null) rasterizeTexturedTriangleClipped(v0, v1, v2, batch.tex, batch.nm, minX, maxX, minY, maxY);
+                else rasterizeTriangleClipped(v0, v1, v2, minX, maxX, minY, maxY);
+            }
+        }
+    }
+    
+    private void rasterizeTriangleClipped(Vertex v0, Vertex v1, Vertex v2, int minX, int maxX, int minY, int maxY) {
+        Vertex[] verts = {v0, v1, v2}; sortByY(verts);
+        if (verts[0].screenY == verts[2].screenY) return;
+        int yStart = Math.max(minY, verts[0].screenY), yEnd = Math.min(maxY, verts[2].screenY);
+        if (yStart > yEnd) return;
+        for (int y = yStart; y <= yEnd; y++) {
+            float t1 = (y - verts[0].screenY) / (float)(verts[2].screenY - verts[0].screenY);
+            int x1 = lerp(verts[0].screenX, verts[2].screenX, t1), x2;
+            float z1 = lerp(verts[0].depth, verts[2].depth, t1), z2;
+            float iw1 = lerp(verts[0].invW, verts[2].invW, t1), iw2;
+            Color c1 = lerpColor(verts[0].color, verts[2].color, t1), c2;
+            if (y < verts[1].screenY) {
+                float t2 = (verts[1].screenY - verts[0].screenY) != 0 ? (y - verts[0].screenY) / (float)(verts[1].screenY - verts[0].screenY) : 0;
+                x2 = lerp(verts[0].screenX, verts[1].screenX, t2); z2 = lerp(verts[0].depth, verts[1].depth, t2);
+                iw2 = lerp(verts[0].invW, verts[1].invW, t2); c2 = lerpColor(verts[0].color, verts[1].color, t2);
+            } else {
+                float t2 = (verts[2].screenY - verts[1].screenY) != 0 ? (y - verts[1].screenY) / (float)(verts[2].screenY - verts[1].screenY) : 0;
+                x2 = lerp(verts[1].screenX, verts[2].screenX, t2); z2 = lerp(verts[1].depth, verts[2].depth, t2);
+                iw2 = lerp(verts[1].invW, verts[2].invW, t2); c2 = lerpColor(verts[1].color, verts[2].color, t2);
+            }
+            if (x1 > x2) { int t = x1; x1 = x2; x2 = t; float f = z1; z1 = z2; z2 = f; f = iw1; iw1 = iw2; iw2 = f; Color tc = c1; c1 = c2; c2 = tc; }
+            x1 = Math.max(minX, x1); x2 = Math.min(maxX, x2); if (x1 > x2) continue;
+            for (int x = x1; x <= x2; x++) {
+                float t = (x - x1) / (float)(x2 - x1 + 1);
+                float depth = lerp(z1, z2, t); int idx = y * width + x;
+                if (depth < zBuffer[idx]) { zBuffer[idx] = depth; writeFragment(idx, lerpColor(c1, c2, t), depth); }
+            }
+        }
+    }
+    
+    private void rasterizeTexturedTriangleClipped(Vertex v0, Vertex v1, Vertex v2, Texture texture, Texture normalMap, int minX, int maxX, int minY, int maxY) {
+        Vertex[] verts = {v0, v1, v2}; sortByY(verts);
+        if (verts[0].screenY == verts[2].screenY) return;
+        int yStart = Math.max(minY, verts[0].screenY), yEnd = Math.min(maxY, verts[2].screenY);
+        if (yStart > yEnd) return;
+        for (int y = yStart; y <= yEnd; y++) {
+            float t1 = (y - verts[0].screenY) / (float)(verts[2].screenY - verts[0].screenY);
+            int x1 = lerp(verts[0].screenX, verts[2].screenX, t1), x2;
+            float z1 = lerp(verts[0].depth, verts[2].depth, t1), z2, u1 = lerp(verts[0].u, verts[2].u, t1), u2;
+            float vv1 = lerp(verts[0].v, verts[2].v, t1), vv2, iw1 = lerp(verts[0].invW, verts[2].invW, t1), iw2;
+            Color c1 = lerpColor(verts[0].color, verts[2].color, t1), c2;
+            if (y < verts[1].screenY) {
+                float t2 = (verts[1].screenY - verts[0].screenY) != 0 ? (y - verts[0].screenY) / (float)(verts[1].screenY - verts[0].screenY) : 0;
+                x2 = lerp(verts[0].screenX, verts[1].screenX, t2); z2 = lerp(verts[0].depth, verts[1].depth, t2);
+                u2 = lerp(verts[0].u, verts[1].u, t2); vv2 = lerp(verts[0].v, verts[1].v, t2);
+                iw2 = lerp(verts[0].invW, verts[1].invW, t2); c2 = lerpColor(verts[0].color, verts[1].color, t2);
+            } else {
+                float t2 = (verts[2].screenY - verts[1].screenY) != 0 ? (y - verts[1].screenY) / (float)(verts[2].screenY - verts[1].screenY) : 0;
+                x2 = lerp(verts[1].screenX, verts[2].screenX, t2); z2 = lerp(verts[1].depth, verts[2].depth, t2);
+                u2 = lerp(verts[1].u, verts[2].u, t2); vv2 = lerp(verts[1].v, verts[2].v, t2);
+                iw2 = lerp(verts[1].invW, verts[2].invW, t2); c2 = lerpColor(verts[1].color, verts[2].color, t2);
+            }
+            if (x1 > x2) { int t = x1; x1 = x2; x2 = t; float f; f = z1; z1 = z2; z2 = f; f = u1; u1 = u2; u2 = f; f = vv1; vv1 = vv2; vv2 = f; f = iw1; iw1 = iw2; iw2 = f; Color tc = c1; c1 = c2; c2 = tc; }
+            x1 = Math.max(minX, x1); x2 = Math.min(maxX, x2); if (x1 > x2) continue;
+            for (int x = x1; x <= x2; x++) {
+                float t = (x - x1) / (float)(x2 - x1 + 1);
+                float depth = lerp(z1, z2, t); int idx = y * width + x;
+                if (depth < zBuffer[idx]) {
+                    zBuffer[idx] = depth;
+                    float iw = lerp(iw1, iw2, t);
+                    float u = ((lerp(u1, u2, t) / iw % 1f) + 1f) % 1f;
+                    float v = ((lerp(vv1, vv2, t) / iw % 1f) + 1f) % 1f;
+                    writeFragment(idx, modulateColor(lerpColor(c1, c2, t), new Color(texture.sample(u, v, 0))), depth);
+                }
+            }
+        }
+    }
+    // ============================================================
+    // SCENE GRAPH
+    // ============================================================
+    public static class Node {
+        public String name;
+        public Node parent;
+        public java.util.List<Node> children = new ArrayList<>();
+        public Matrix4x4 localTransform = new Matrix4x4();
+        public Matrix4x4 worldTransform = new Matrix4x4();
+        public Mesh mesh;
+        public Texture texture, normalMap;
+        public boolean visible = true;
+        
+        public Node(String name) { this.name = name; }
+        public Node addChild(Node child) { child.parent = this; children.add(child); return this; }
+        public Node translate(float x, float y, float z) { localTransform.translate(x, y, z); return this; }
+        public Node rotateX(float a) { localTransform.rotateX(a); return this; }
+        public Node rotateY(float a) { localTransform.rotateY(a); return this; }
+        public Node rotateZ(float a) { localTransform.rotateZ(a); return this; }
+        public Node scale(float x, float y, float z) { localTransform.scale(x, y, z); return this; }
+        public Node setMesh(Mesh m) { mesh = m; return this; }
+        public Node setTexture(Texture t) { texture = t; return this; }
+        
+        public void updateWorld(Matrix4x4 parentWorld) {
+            worldTransform.mul(parentWorld, localTransform);
+            for (Node child : children) child.updateWorld(worldTransform);
+        }
+    }
+    
+    public void renderNode(Node node) {
+        if (!node.visible) return;
+        if (node.mesh != null) renderMesh(node.mesh, node.worldTransform, node.texture, node.normalMap);
+        for (Node child : node.children) renderNode(child);
+    }
+    
+    // ============================================================
+    // INPUT SYSTEM
+    // ============================================================
+    public static class Input {
+        public boolean[] keys = new boolean[512];
+        public boolean[] mouseButtons = new boolean[8];
+        public int mouseX, mouseY, mouseDX, mouseDY;
+        public boolean mouseInWindow;
+        
+        public boolean key(int code) { return code >= 0 && code < keys.length && keys[code]; }
+        public boolean keyPressed(int code) { return key(code); }
+        public boolean mouseButton(int btn) { return btn >= 0 && btn < mouseButtons.length && mouseButtons[btn]; }
+        
+        public void update() { mouseDX = 0; mouseDY = 0; }
+        
+        public java.awt.event.KeyAdapter keyAdapter() {
+            return new java.awt.event.KeyAdapter() {
+                public void keyPressed(java.awt.event.KeyEvent e) { if (e.getKeyCode() < keys.length) keys[e.getKeyCode()] = true; }
+                public void keyReleased(java.awt.event.KeyEvent e) { if (e.getKeyCode() < keys.length) keys[e.getKeyCode()] = false; }
+            };
+        }
+        
+        public java.awt.event.MouseAdapter mouseAdapter() {
+            return new java.awt.event.MouseAdapter() {
+                public void mousePressed(java.awt.event.MouseEvent e) { if (e.getButton() < mouseButtons.length) mouseButtons[e.getButton()] = true; }
+                public void mouseReleased(java.awt.event.MouseEvent e) { if (e.getButton() < mouseButtons.length) mouseButtons[e.getButton()] = false; }
+                public void mouseMoved(java.awt.event.MouseEvent e) { mouseDX = e.getX() - mouseX; mouseDY = e.getY() - mouseY; mouseX = e.getX(); mouseY = e.getY(); }
+                public void mouseDragged(java.awt.event.MouseEvent e) { mouseDX = e.getX() - mouseX; mouseDY = e.getY() - mouseY; mouseX = e.getX(); mouseY = e.getY(); }
+                public void mouseEntered(java.awt.event.MouseEvent e) { mouseInWindow = true; }
+                public void mouseExited(java.awt.event.MouseEvent e) { mouseInWindow = false; }
+            };
+        }
+    }
+    
+    // ============================================================
+    // PHYSICS
+    // ============================================================
+    public static class AABB {
+        public Vec3 min = new Vec3(), max = new Vec3();
+        public AABB() {}
+        public AABB(Vec3 min, Vec3 max) { this.min = min; this.max = max; }
+        public AABB centerExtents(Vec3 center, Vec3 extents) { min = center.sub(extents); max = center.add(extents); return this; }
+        public boolean overlaps(AABB other) {
+            return min.x <= other.max.x && max.x >= other.min.x &&
+                   min.y <= other.max.y && max.y >= other.min.y &&
+                   min.z <= other.max.z && max.z >= other.min.z;
+        }
+        public Vec3 center() { return new Vec3((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f, (min.z + max.z) * 0.5f); }
+    }
+    
+    public static class RigidBody {
+        public Vec3 position = new Vec3(), velocity = new Vec3();
+        public AABB bounds = new AABB();
+        public float mass = 1f, restitution = 0.5f;
+        public boolean useGravity = true, isStatic = false;
+        
+        public RigidBody(Vec3 pos, Vec3 size) {
+            position = pos; bounds.centerExtents(pos, size);
+        }
+        
+        public void update(float dt, Vec3 gravity) {
+            if (isStatic) return;
+            if (useGravity) velocity = velocity.add(gravity.scale(dt));
+            position = position.add(velocity.scale(dt));
+            bounds.centerExtents(position, bounds.center().sub(bounds.min));
+        }
+        
+        public boolean collide(RigidBody other) {
+            if (!bounds.overlaps(other.bounds)) return false;
+            Vec3 overlap = new Vec3(
+                Math.min(bounds.max.x - other.bounds.min.x, other.bounds.max.x - bounds.min.x),
+                Math.min(bounds.max.y - other.bounds.min.y, other.bounds.max.y - bounds.min.y),
+                Math.min(bounds.max.z - other.bounds.min.z, other.bounds.max.z - bounds.min.z));
+            float minOverlap = Math.min(overlap.x, Math.min(overlap.y, overlap.z));
+            Vec3 normal;
+            if (overlap.x == minOverlap) normal = new Vec3(velocity.x > 0 ? -1 : 1, 0, 0);
+            else if (overlap.y == minOverlap) normal = new Vec3(0, velocity.y > 0 ? -1 : 1, 0);
+            else normal = new Vec3(0, 0, velocity.z > 0 ? -1 : 1);
+            float impulse = -(1 + restitution) * velocity.dot(normal) / (1/mass + 1/other.mass);
+            velocity = velocity.add(normal.scale(impulse / mass));
+            position = position.add(normal.scale(minOverlap * 0.5f));
+            other.position = other.position.add(normal.scale(-minOverlap * 0.5f));
+            return true;
+        }
+    }
+    
+    // ============================================================
+    // SHADER INTERFACE
+    // ============================================================
+    @FunctionalInterface
+    public interface VertexShader {
+        Vec4 process(Vec4 position, Vec3 normal, Vec2 uv, Color color);
+    }
+    
+    @FunctionalInterface
+    public interface FragmentShader {
+        int process(Vec3 barycentric, Vec3 worldPos, Vec3 normal, Vec2 uv, Color color);
+    }
+    
+    public static class Vec2 { public float x, y; public Vec2() {} public Vec2(float x, float y) { this.x = x; this.y = y; } }
+    
+    public static class ShaderProgram {
+        public VertexShader vertex;
+        public FragmentShader fragment;
+        public Texture texture, normalMap;
+        public boolean hasTexture = false;
+        
+        public ShaderProgram(VertexShader vs, FragmentShader fs) { vertex = vs; fragment = fs; }
+        public ShaderProgram texture(Texture t) { texture = t; hasTexture = true; return this; }
+        public ShaderProgram normalMap(Texture n) { normalMap = n; return this; }
+    }
+    
+    public void renderWithShader(Mesh mesh, Matrix4x4 world, ShaderProgram shader) {
+        // Override vertex processing with custom shader
+        mvpMatrix.mul(viewProjMatrix, world);
+        for (int i = 0; i < mesh.numTriangles; i++) {
+            int i0 = mesh.indices[i * 3], i1 = mesh.indices[i * 3 + 1], i2 = mesh.indices[i * 3 + 2];
+            Vertex v0 = mesh.vertices[i0], v1 = mesh.vertices[i1], v2 = mesh.vertices[i2];
+            if (shader.vertex != null) {
+                Vec4 p0 = shader.vertex.process(v0.position, v0.normal, new Vec2(v0.u, v0.v), v0.color);
+                Vec4 p1 = shader.vertex.process(v1.position, v1.normal, new Vec2(v1.u, v1.v), v1.color);
+                Vec4 p2 = shader.vertex.process(v2.position, v2.normal, new Vec2(v2.u, v2.v), v2.color);
+                v0.position = p0; v1.position = p1; v2.position = p2;
+            }
+            renderMesh(mesh, world, shader.hasTexture ? shader.texture : null, shader.normalMap);
+        }
+    }
+    
+    // ============================================================
+    // OBJECT POOL
+    // ============================================================
+    public static class VertexPool {
+        private final java.util.List<Vertex> pool = new ArrayList<>();
+        private int taken = 0;
+        
+        public Vertex get() {
+            if (taken < pool.size()) return pool.get(taken++);
+            Vertex v = new Vertex(); pool.add(v); taken++; return v;
+        }
+        
+        public void reset() { taken = 0; }
+        public int active() { return taken; }
+        public int total() { return pool.size(); }
+    }
+    
+    // ============================================================
+    // AUDIO
+    // ============================================================
+    public static class Audio {
+        private javax.sound.sampled.SourceDataLine line;
+        private boolean available = false;
+        
+        public Audio() {
+            try {
+                javax.sound.sampled.AudioFormat fmt = new javax.sound.sampled.AudioFormat(44100, 16, 1, true, false);
+                line = javax.sound.sampled.AudioSystem.getSourceDataLine(fmt);
+                line.open(fmt, 4096);
+                line.start();
+                available = true;
+            } catch (Exception e) { available = false; }
+        }
+        
+        public void playTone(float freq, float duration, float volume) {
+            if (!available) return;
+            int samples = (int)(44100 * duration);
+            byte[] buf = new byte[samples * 2];
+            for (int i = 0; i < samples; i++) {
+                float t = (float)i / 44100;
+                float env = Math.min(1, (samples - i) / (44100f * 0.05f));
+                short s = (short)(volume * 32767 * Math.sin(2 * Math.PI * freq * t) * env);
+                buf[i * 2] = (byte)(s & 0xFF);
+                buf[i * 2 + 1] = (byte)((s >> 8) & 0xFF);
+            }
+            line.write(buf, 0, buf.length);
+        }
+        
+        public void playClick() { playTone(1000, 0.05f, 0.3f); }
+        public void playHit() { playTone(200, 0.15f, 0.5f); }
+        public void close() { if (line != null) { line.drain(); line.close(); } }
+    }
+}
 
 
 
