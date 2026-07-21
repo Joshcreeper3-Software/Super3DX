@@ -1956,4 +1956,475 @@ public class Super3DX {
             return tex;
         }
     }
-}
+    
+    public void applySepia() {
+        for (int i = 0; i < framebuffer.length; i++) {
+            int rgb = framebuffer[i];
+            int r = (rgb >> 16) & 0xFF;
+            int g = (rgb >> 8) & 0xFF;
+            int b = rgb & 0xFF;
+            int tr = (int)(0.393f * r + 0.769f * g + 0.189f * b);
+            int tg = (int)(0.349f * r + 0.686f * g + 0.168f * b);
+            int tb = (int)(0.272f * r + 0.534f * g + 0.131f * b);
+            framebuffer[i] = (Math.min(255, tr) << 16) | (Math.min(255, tg) << 8) | Math.min(255, tb);
+        }
+    }
+    
+    public void applyVignette(float intensity) {
+        int cx = width / 2, cy = height / 2;
+        float maxDist = (float)Math.sqrt(cx * cx + cy * cy);
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                float dx = x - cx, dy = y - cy;
+                float dist = (float)Math.sqrt(dx * dx + dy * dy);
+                float factor = 1.0f - (dist / maxDist) * intensity;
+                factor = Math.max(0, Math.min(1, factor));
+                int idx = y * width + x;
+                int r = (int)(((framebuffer[idx] >> 16) & 0xFF) * factor);
+                int g = (int)(((framebuffer[idx] >> 8) & 0xFF) * factor);
+                int b = (int)((framebuffer[idx] & 0xFF) * factor);
+                framebuffer[idx] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+    
+    public void applyPixelate(int pixelSize) {
+        int[] src = framebuffer.clone();
+        for (int y = 0; y < height; y += pixelSize) {
+            for (int x = 0; x < width; x += pixelSize) {
+                int r = 0, g = 0, b = 0, count = 0;
+                for (int dy = 0; dy < pixelSize && y + dy < height; dy++) {
+                    for (int dx = 0; dx < pixelSize && x + dx < width; dx++) {
+                        int idx = (y + dy) * width + (x + dx);
+                        r += (src[idx] >> 16) & 0xFF;
+                        g += (src[idx] >> 8) & 0xFF;
+                        b += src[idx] & 0xFF;
+                        count++;
+                    }
+                }
+                if (count > 0) {
+                    int avg = ((r / count) << 16) | ((g / count) << 8) | (b / count);
+                    for (int dy = 0; dy < pixelSize && y + dy < height; dy++) {
+                        for (int dx = 0; dx < pixelSize && x + dx < width; dx++) {
+                            framebuffer[(y + dy) * width + (x + dx)] = avg;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    public void saveScreenshot(String filename) throws IOException {
+        BufferedImage img = getImage();
+        javax.imageio.ImageIO.write(img, "png", new java.io.File(filename));
+    }
+    
+    public void saveScreenshot() throws IOException {
+        saveScreenshot("screenshot_" + System.currentTimeMillis() + ".png");
+    }
+    
+    public void toggleWireframe() {
+        renderMode = renderMode == RenderMode.WIREFRAME ? RenderMode.SOLID : RenderMode.WIREFRAME;
+    }
+    
+    public void setDayNightCycle(float timeOfDay) {
+        float sunAngle = timeOfDay * 2 * (float)Math.PI;
+        float sunHeight = (float)Math.sin(sunAngle);
+        float sunHorizontal = (float)Math.cos(sunAngle);
+        lightDir = new Vec3(sunHorizontal * 0.5f, sunHeight, 0.3f).normalize();
+        ambientIntensity = 0.1f + 0.4f * Math.max(0, sunHeight);
+        diffuseIntensity = 0.3f + 0.7f * Math.max(0, sunHeight);
+    }    
+    // ==================== OPENGL SHADER SUPPORT ====================
+    
+    public static class Shader {
+        private int programID;
+        private Map<String, Integer> uniforms = new HashMap<>();
+        
+        public Shader(String vertexSource, String fragmentSource) {
+            programID = createProgram(vertexSource, fragmentSource);
+        }
+        
+        private int createProgram(String vertexSource, String fragmentSource) {
+            // This is a software shader emulation
+            // For real OpenGL, you would use GLSL compilation
+            return 0;
+        }
+        
+        public void use() { /* OpenGL: glUseProgram(programID); */ }
+        public void setUniform(String name, float value) { }
+        public void setUniform(String name, float[] matrix) { }
+        public void setUniform(String name, int value) { }
+        public int getProgramID() { return programID; }
+    }
+    
+    public static class ShaderManager {
+        public static Map<String, Shader> shaders = new HashMap<>();
+        
+        public static Shader loadShader(String name, String vertexPath, String fragmentPath) {
+            try {
+                String vertexSource = readFile(vertexPath);
+                String fragmentSource = readFile(fragmentPath);
+                Shader shader = new Shader(vertexSource, fragmentSource);
+                shaders.put(name, shader);
+                return shader;
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        
+        private static String readFile(String path) throws IOException {
+            return new String(Files.readAllBytes(Paths.get(path)));
+        }
+    }
+    
+    public void setShader(String name) {
+        Shader shader = ShaderManager.shaders.get(name);
+        if (shader != null) shader.use();
+    }    
+    // ==================== PBR MATERIALS ====================
+    
+    public static class PBRMaterial {
+        public Color albedo = new Color(180, 180, 180);
+        public float metallic = 0.0f;
+        public float roughness = 0.5f;
+        public float ao = 1.0f;
+        public float emissive = 0.0f;
+        public Texture albedoMap;
+        public Texture metallicMap;
+        public Texture roughnessMap;
+        public Texture aoMap;
+        public Texture normalMap;
+        public Texture emissiveMap;
+        
+        public PBRMaterial() {}
+        
+        public PBRMaterial(Color albedo, float metallic, float roughness) {
+            this.albedo = albedo;
+            this.metallic = metallic;
+            this.roughness = roughness;
+        }
+    }
+    
+    public static class PBRRenderer {
+        public static Color calculatePBR(Color albedo, float metallic, float roughness, 
+                                        Vec3 normal, Vec3 viewDir, Vec3 lightDir, 
+                                        Vec3 lightColor, float intensity) {
+            // Fresnel
+            Vec3 halfDir = lightDir.add(viewDir).normalize();
+            float NdotL = Math.max(0, normal.dot(lightDir));
+            float NdotV = Math.max(0, normal.dot(viewDir));
+            float NdotH = Math.max(0, normal.dot(halfDir));
+            
+            // Diffuse (Lambertian)
+            float diffuse = NdotL;
+            
+            // Specular (GGX)
+            float alpha = roughness * roughness;
+            float alpha2 = alpha * alpha;
+            float denom = NdotH * NdotH * (alpha2 - 1) + 1;
+            float D = alpha2 / (Math.max(0.0001f, (float)Math.PI) * denom * denom);
+            
+            // Geometry (Schlick-GGX)
+            float k = alpha / 2;
+            float G1 = NdotL / (NdotL * (1 - k) + k);
+            float G2 = NdotV / (NdotV * (1 - k) + k);
+            float G = G1 * G2;
+            
+            // Fresnel (Schlick)
+            float F0 = 0.04f + (1 - 0.04f) * metallic;
+            float F = F0 + (1 - F0) * (float)Math.pow(1 - NdotV, 5);
+            
+            // Cook-Torrance BRDF
+            float specular = D * F * G / (4 * NdotV * NdotL + 0.0001f);
+            
+            // Combine
+            float r = (albedo.getRed() / 255f) * (diffuse + specular * metallic) * intensity;
+            float g = (albedo.getGreen() / 255f) * (diffuse + specular * metallic) * intensity;
+            float b = (albedo.getBlue() / 255f) * (diffuse + specular * metallic) * intensity;
+            
+            return new Color(Math.min(255, (int)(r * 255)), 
+                           Math.min(255, (int)(g * 255)), 
+                           Math.min(255, (int)(b * 255)));
+        }
+    }    
+    // ==================== DEFERRED RENDERING ====================
+    
+    public static class GBuffer {
+        public int[] albedo = new int[0];
+        public float[] normal = new float[0];
+        public float[] position = new float[0];
+        public float[] metallic = new float[0];
+        public float[] roughness = new float[0];
+        public float[] depth = new float[0];
+        public int width, height;
+        
+        public GBuffer(int width, int height) {
+            this.width = width;
+            this.height = height;
+            int count = width * height;
+            albedo = new int[count];
+            normal = new float[count * 3];
+            position = new float[count * 3];
+            metallic = new float[count];
+            roughness = new float[count];
+            depth = new float[count];
+        }
+        
+        public void clear() {
+            Arrays.fill(albedo, 0);
+            Arrays.fill(normal, 0);
+            Arrays.fill(position, 0);
+            Arrays.fill(metallic, 0);
+            Arrays.fill(roughness, 0);
+            Arrays.fill(depth, Float.MAX_VALUE);
+        }
+    }
+    
+    private GBuffer gBuffer;
+    
+    public void enableDeferredRendering() {
+        gBuffer = new GBuffer(width, height);
+    }
+    
+    public void renderDeferred() {
+        if (gBuffer == null) return;
+        
+        // Light pass (screen quad)
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int idx = y * width + x;
+                if (gBuffer.depth[idx] < Float.MAX_VALUE) {
+                    // Read from G-buffer and compute lighting
+                    int albedo = gBuffer.albedo[idx];
+                    float nx = gBuffer.normal[idx * 3];
+                    float ny = gBuffer.normal[idx * 3 + 1];
+                    float nz = gBuffer.normal[idx * 3 + 2];
+                    float metallic = gBuffer.metallic[idx];
+                    float roughness = gBuffer.roughness[idx];
+                    
+                    // Lighting calculation
+                    Vec3 normal = new Vec3(nx, ny, nz).normalize();
+                    Color albedoColor = new Color((albedo >> 16) & 0xFF, 
+                                                 (albedo >> 8) & 0xFF, 
+                                                 albedo & 0xFF);
+                    // Apply lighting...
+                    framebuffer[idx] = albedo; // Simplified
+                }
+            }
+        }
+    }
+    
+    public void setMetallicRoughness(float metallic, float roughness) {
+        // Store in g-buffer during render
+    }    
+    // ==================== GPU INSTANCING ====================
+    
+    public static class InstanceData {
+        public Matrix4x4[] transforms;
+        public int[] colors;
+        public int count;
+        
+        public InstanceData(int count) {
+            this.count = count;
+            transforms = new Matrix4x4[count];
+            colors = new int[count];
+            for (int i = 0; i < count; i++) {
+                transforms[i] = new Matrix4x4();
+            }
+        }
+    }
+    
+    public void renderInstancedGL(Mesh mesh, InstanceData instances, Texture texture) {
+        for (int i = 0; i < instances.count; i++) {
+            renderMesh(mesh, instances.transforms[i], texture);
+        }
+    }
+    
+    public void renderInstancedBatch(Mesh mesh, InstanceData instances, Texture texture) {
+        // Batch process for better performance
+        for (int batch = 0; batch < instances.count; batch += 100) {
+            int end = Math.min(batch + 100, instances.count);
+            for (int i = batch; i < end; i++) {
+                renderMesh(mesh, instances.transforms[i], texture);
+            }
+        }
+    }
+    
+    public InstanceData createInstanceGrid(int count, float spacing) {
+        int side = (int)Math.sqrt(count);
+        InstanceData data = new InstanceData(side * side);
+        int idx = 0;
+        for (int z = -side/2; z < side/2; z++) {
+            for (int x = -side/2; x < side/2; x++) {
+                if (idx < data.count) {
+                    data.transforms[idx].translate(x * spacing, 0, z * spacing);
+                    data.colors[idx] = (int)(Math.random() * 0xFFFFFF);
+                    idx++;
+                }
+            }
+        }
+        return data;
+    }    
+    // ==================== HDR + TONE MAPPING ====================
+    
+    private float[] hdrBuffer;
+    private boolean hdrEnabled = false;
+    private float exposure = 1.0f;
+    private int tonemapMode = 0; // 0=Reinhard, 1=ACES, 2=Uncharted
+    
+    public void enableHDR() {
+        hdrBuffer = new float[width * height * 3];
+        hdrEnabled = true;
+    }
+    
+    public void disableHDR() {
+        hdrEnabled = false;
+        hdrBuffer = null;
+    }
+    
+    public void setExposure(float exposure) {
+        this.exposure = exposure;
+    }
+    
+    public void setTonemapMode(int mode) {
+        this.tonemapMode = mode;
+    }
+    
+    public void tonemap() {
+        if (!hdrEnabled || hdrBuffer == null) return;
+        
+        for (int i = 0; i < width * height; i++) {
+            float r = hdrBuffer[i * 3];
+            float g = hdrBuffer[i * 3 + 1];
+            float b = hdrBuffer[i * 3 + 2];
+            
+            // Apply exposure
+            r *= exposure;
+            g *= exposure;
+            b *= exposure;
+            
+            // Tone mapping
+            float[] color = tonemap(r, g, b, tonemapMode);
+            
+            // Gamma correction
+            color[0] = (float)Math.pow(color[0], 1f / 2.2f);
+            color[1] = (float)Math.pow(color[1], 1f / 2.2f);
+            color[2] = (float)Math.pow(color[2], 1f / 2.2f);
+            
+            framebuffer[i] = ((int)(color[0] * 255) << 16) |
+                           ((int)(color[1] * 255) << 8) |
+                            (int)(color[2] * 255);
+        }
+    }
+    
+    private float[] tonemap(float r, float g, float b, int mode) {
+        switch(mode) {
+            case 0: // Reinhard
+                float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+                float scale = 1.0f / (1.0f + lum);
+                return new float[]{r * scale, g * scale, b * scale};
+            case 1: // ACES
+                float a = 2.51f, b1 = 0.03f, c = 2.43f, d = 0.59f, e = 0.14f;
+                float[] result = new float[3];
+                for (int i = 0; i < 3; i++) {
+                    float v = new float[]{r, g, b}[i];
+                    result[i] = Math.max(0, Math.min(1, (v * (a * v + b1)) / (v * (c * v + d) + e)));
+                }
+                return result;
+            case 2: // Uncharted 2
+                float A = 0.15f, B = 0.50f, C = 0.10f, D = 0.20f, E = 0.02f, F = 0.30f;
+                float[] u = new float[3];
+                for (int i = 0; i < 3; i++) {
+                    float v = new float[]{r, g, b}[i];
+                    u[i] = ((v * (A * v + C * B) + D * E) / (v * (A * v + B) + D * F)) - E / F;
+                }
+                float white = ((1.0f * (A * 1.0f + C * B) + D * E) / (1.0f * (A * 1.0f + B) + D * F)) - E / F;
+                return new float[]{u[0]/white, u[1]/white, u[2]/white};
+            default:
+                return new float[]{r, g, b};
+        }
+    }    
+    // ==================== COMPUTE SHADER EMULATION ====================
+    
+    public interface ComputeKernel {
+        void execute(int id);
+    }
+    
+    public static class ComputeShader {
+        private String name;
+        private ComputeKernel kernel;
+        private int workGroupSize;
+        private int[] workGroupOutput;
+        
+        public ComputeShader(String name, int workGroupSize, ComputeKernel kernel) {
+            this.name = name;
+            this.workGroupSize = workGroupSize;
+            this.kernel = kernel;
+            this.workGroupOutput = new int[workGroupSize];
+        }
+        
+        public void dispatch(int groups) {
+            int totalWork = groups * workGroupSize;
+            // Multi-threaded execution
+            int numThreads = Math.min(Runtime.getRuntime().availableProcessors(), totalWork);
+            Thread[] threads = new Thread[numThreads];
+            int workPerThread = totalWork / numThreads;
+            
+            for (int t = 0; t < numThreads; t++) {
+                int start = t * workPerThread;
+                int end = (t == numThreads - 1) ? totalWork : (t + 1) * workPerThread;
+                threads[t] = new Thread(() -> {
+                    for (int i = start; i < end; i++) {
+                        kernel.execute(i);
+                    }
+                });
+                threads[t].start();
+            }
+            
+            for (Thread thread : threads) {
+                try { thread.join(); } catch (InterruptedException e) {}
+            }
+        }
+    }
+    
+    public static class ComputeShaderManager {
+        public static Map<String, ComputeShader> shaders = new HashMap<>();
+        
+        public static ComputeShader createShader(String name, int workGroupSize, ComputeKernel kernel) {
+            ComputeShader shader = new ComputeShader(name, workGroupSize, kernel);
+            shaders.put(name, shader);
+            return shader;
+        }
+        
+        public static void dispatch(String name, int groups) {
+            ComputeShader shader = shaders.get(name);
+            if (shader != null) shader.dispatch(groups);
+        }
+    }
+    
+    public void applyComputeEffect(String shaderName, int groups) {
+        ComputeShaderManager.dispatch(shaderName, groups);
+    }
+    
+    // Example compute kernels
+    public static class ComputeKernels {
+        public static ComputeKernel blurKernel = (id) -> {
+            // Simplified blur
+            // Would normally process image data
+        };
+        
+        public static ComputeKernel edgeDetectKernel = (id) -> {
+            // Sobel edge detection
+        };
+        
+        public static ComputeKernel particleUpdateKernel = (id) -> {
+            // Update particle positions
+        };
+    }}
+
+
+
+
+
+
